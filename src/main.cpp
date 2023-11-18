@@ -76,6 +76,7 @@ enum MachineState {
     kBackflush = 50,
     kEmergencyStop = 80,
     kPidOffline = 90,
+    kStandby = 95,
     kSensorError = 100,
     kEepromError = 110,
 };
@@ -152,6 +153,7 @@ void setNormalPIDTunings();
 void setBDPIDTunings();
 void loopcalibrate();
 void looppid();
+void loopLED();
 void printMachineState();
 char const* machinestateEnumToString(MachineState machineState);
 void initSteamQM();
@@ -161,7 +163,9 @@ char *number2string(float in);
 char *number2string(int in);
 char *number2string(unsigned int in);
 float filterPressureValue(float input);
-void writeSysParamsToMQTT(void);
+int writeSysParamsToMQTT(bool continueOnError);
+void updateStandbyTimer(void);
+void resetStandbyTimer(void);
 
 
 // system parameters
@@ -200,6 +204,11 @@ double brewtimesoftware = BREW_SW_TIME;  // use userConfig time until disabling 
 double brewSensitivity = BD_SENSITIVITY;  // use userConfig brew detection sensitivity
 double brewPIDDelay = BREW_PID_DELAY;      // use userConfig brew detection PID delay
 
+uint8_t standbyModeOn = 0;
+double standbyModeTime = STANDBY_MODE_TIME;
+
+#include "standby.h"
+
 // system parameter EEPROM storage wrappers (current value as pointer to variable, minimum, maximum, optional storage ID)
 SysPara<uint8_t> sysParaPidOn(&pidON, 0, 1, STO_ITEM_PID_ON);
 SysPara<uint8_t> sysParaUsePonM(&usePonM, 0, 1, STO_ITEM_PID_START_PONM);
@@ -225,6 +234,8 @@ SysPara<double> sysParaPreInfPause(&preinfusionpause, PRE_INFUSION_PAUSE_MIN, PR
 SysPara<double> sysParaPidKpSteam(&steamKp, PID_KP_STEAM_MIN, PID_KP_STEAM_MAX, STO_ITEM_PID_KP_STEAM);
 SysPara<double> sysParaSteamSetpoint(&steamSetpoint, STEAM_SETPOINT_MIN, STEAM_SETPOINT_MAX, STO_ITEM_STEAM_SETPOINT);
 SysPara<double> sysParaWeightSetpoint(&weightSetpoint, WEIGHTSETPOINT_MIN, WEIGHTSETPOINT_MAX, STO_ITEM_WEIGHTSETPOINT);
+SysPara<uint8_t> sysParaStandbyModeOn(&standbyModeOn, 0, 1, STO_ITEM_STANDBY_MODE_ON);
+SysPara<double> sysParaStandbyModeTime(&standbyModeTime, STANDBY_MODE_TIME_MIN, STANDBY_MODE_TIME_MAX, STO_ITEM_STANDBY_MODE_TIME);
 
 // Other variables
 int relayON, relayOFF;           // used for relay trigger type. Do not change!
@@ -309,6 +320,7 @@ enum SectionNames {
     sPIDSection,
     sTempSection,
     sBDSection,
+    sPowerSection,
     sOtherSection
 };
 
@@ -331,6 +343,13 @@ std::map<const char*, std::function<double()>, cmp_str> mqttSensors = {};
 
 unsigned long lastTempEvent = 0;
 unsigned long tempEventInterval = 1000;
+
+#if MQTT_HASSIO_SUPPORT == 1
+static unsigned long lastHomeAssistantDiscoveryExecutionTime = 0;
+const unsigned long HomeAssistantDiscoveryExecutionInterval = 300000;  // 5 minute
+#endif
+
+bool mqtt_was_connected = false;
 
 /**
  * @brief Get Wifi signal strength and set signalBars for display
@@ -567,7 +586,7 @@ void refreshTemp() {
             previousMillistemp = currentMillistemp;
 
             #if TEMPSENSOR == 2
-                temperature = Sensor2.getTemp();
+                temperature = Sensor2.getTemp(15);
             #endif
 
             if (machineState != kSteam) {
@@ -592,6 +611,7 @@ void refreshTemp() {
 
 #include "brewvoid.h"
 #include "powerswitchvoid.h"
+#include "steamswitchvoid.h"
 #include "scalevoid.h"
 
 /**
@@ -659,9 +679,11 @@ void checkWifi() {
     } while (!setupDone && wifiReconnects < maxWifiReconnects && WiFi.status() != WL_CONNECTED);
 
 
-    if (wifiReconnects >= maxWifiReconnects && !setupDone) {  // no wifi connection after boot, initiate offline mode
-        // (only directly after boot)
+    if (wifiReconnects >= maxWifiReconnects && WiFi.status() != WL_CONNECTED) { 
+        // no wifi connection after trying connection, initiate offline mode
         initOfflineMode();
+    } else { 
+        wifiReconnects = 0;
     }
 }
 
@@ -838,15 +860,6 @@ float filterPressureValue(float input) {
  * @brief steamON & Quickmill
  */
 void checkSteamON() {
-    // check digital GIPO
-    if (digitalRead(PIN_STEAMSWITCH) == HIGH) {
-        steamON = 1;
-    }
-
-    // if activated via web interface then steamFirstON == 1, prevent override
-    if (digitalRead(PIN_STEAMSWITCH) == LOW && steamFirstON == 0) {
-        steamON = 0;
-    }
 
     // monitor QuickMill thermoblock steam-mode
     if (machine == QuickMill) {
@@ -970,23 +983,41 @@ void handleMachineState() {
                 (ONLYPID == 0 && brewcounter > kBrewIdle && brewcounter <= kBrewFinished))
             {
                 machineState = kBrew;
+
+                if (standbyModeOn) {
+                    resetStandbyTimer();
+                } 
             }
 
             if (steamON == 1) {
                 machineState = kSteam;
+
+                if (standbyModeOn) {
+                    resetStandbyTimer();
+                } 
             }
 
             if (backflushON || backflushState > 10) {
                 machineState = kBackflush;
+
+                if (standbyModeOn) {
+                    resetStandbyTimer();
+                } 
             }
 
-            if (pidON == 0) {
+            if (standbyModeOn && standbyModeRemainingTimeMillis == 0) {
+                machineState = kStandby;
+                pidON = 0;
+            }
+
+            if (pidON == 0 && machineState != kStandby) {
                 machineState = kPidOffline;
             }
 
             if (sensorError) {
                 machineState = kSensorError;
             }
+
             break;
 
         // Setpoint is below current temperature
@@ -1001,23 +1032,41 @@ void handleMachineState() {
                 (ONLYPID == 0 && brewcounter > kBrewIdle && brewcounter <= kBrewFinished))
             {
                 machineState = kBrew;
+
+                if (standbyModeOn) {
+                    resetStandbyTimer();
+                } 
             }
 
             if (backflushON || backflushState > 10) {
                 machineState = kBackflush;
+
+                if (standbyModeOn) {
+                    resetStandbyTimer();
+                } 
             }
 
             if (steamON == 1) {
                 machineState = kSteam;
+
+                if (standbyModeOn) {
+                    resetStandbyTimer();
+                } 
             }
 
-            if (pidON == 0) {
+            if (standbyModeOn && standbyModeRemainingTimeMillis == 0) {
+                machineState = kStandby;
+                pidON = 0;
+            }
+
+            if (pidON == 0 && machineState != kStandby) {
                 machineState = kPidOffline;
             }
 
             if (sensorError) {
                 machineState = kSensorError;
             }
+
             break;
 
         case kPidNormal:
@@ -1027,21 +1076,38 @@ void handleMachineState() {
                 (ONLYPID == 0 && brewcounter > kBrewIdle && brewcounter <= kBrewFinished))
             {
                 machineState = kBrew;
+
+                if (standbyModeOn) {
+                    resetStandbyTimer();
+                }
             }
 
             if (steamON == 1) {
                 machineState = kSteam;
+
+                if (standbyModeOn) {
+                    resetStandbyTimer();
+                } 
             }
 
             if (backflushON || backflushState > 10) {
                 machineState = kBackflush;
+
+                if (standbyModeOn) {
+                    resetStandbyTimer();
+                } 
             }
 
             if (emergencyStop) {
                 machineState = kEmergencyStop;
             }
+             
+            if (standbyModeOn && standbyModeRemainingTimeMillis == 0) {
+                machineState = kStandby;
+                pidON = 0;
+            }
 
-            if (pidON == 0) {
+            if (pidON == 0 && machineState != kStandby) {
                 machineState = kPidOffline;
             }
 
@@ -1261,6 +1327,27 @@ void handleMachineState() {
                 machineState = kSensorError;
             }
             break;
+        
+        case kStandby:
+            brewDetection();
+            
+            if (pidON || steamON || isBrewDetected) {
+                pidON = 1;
+                resetStandbyTimer();
+
+                if (steamON) {
+                    machineState = kSteam;
+                } else if (isBrewDetected) {
+                    machineState = kBrew;
+                } else {
+                    machineState = kPidNormal;
+                }
+            }
+             
+            if (sensorError) {
+                machineState = kSensorError;
+            }
+            break;
 
         case kSensorError:
             machineState = kSensorError;
@@ -1308,6 +1395,8 @@ char const* machinestateEnumToString(MachineState machineState) {
             return "Emergency Stop";
         case kPidOffline:
             return "PID Offline";
+        case kStandby:
+            return "Standby Mode";
         case kSensorError:
             return "Sensor Error";
         case kEepromError:
@@ -1335,19 +1424,18 @@ void debugVerboseOutput() {
  */
 void wiFiSetup() {
     wm.setCleanConnect(true);
-    wm.setConfigPortalTimeout(60); // sec Timeout for Portal
-    wm.setConnectTimeout(10); // Try 10 sec to connect to WLAN, 5 sec too short!
+    wm.setConfigPortalTimeout(60);      // sec timeout for captive portal
+    wm.setConnectTimeout(10);           // using 10s to connect to WLAN, 5s is sometimes too short!
     wm.setBreakAfterConfig(true);
     wm.setConnectRetries(3);
 
-    // Wifisetup fro
     sysParaWifiCredentialsSaved.getStorage();
 
     if (wifiCredentialsSaved == 0) {
         const char hostname[] = (STR(HOSTNAME));
-        debugPrintf("Connect to WiFi: %s \n", String(hostname));
+        debugPrintf("Connecting to WiFi: %s \n", String(hostname));
         #if OLED_DISPLAY != 0
-            displayLogo("Connect to WiFi: ", HOSTNAME);
+            displayLogo("Connecting to: ", HOSTNAME);
         #endif
     }
 
@@ -1809,13 +1897,40 @@ void setup() {
         .ptr = (void *)&backflushON
     };
 
+    editableVars["STANDBY_MODE_ON"] = {
+        .displayName = F("Enable Standby Timer"),
+        .hasHelpText = true,
+        .helpText = F("Turn heater off after standby time has elapsed."),
+        .type = kUInt8,
+        .section = sPowerSection,
+        .position = 27,
+        .show = [] { return true; },
+        .minValue = 0,
+        .maxValue = 1,
+        .ptr = (void *)&standbyModeOn
+    };
+
+    editableVars["STANDBY_MODE_TIMER"] = {
+        .displayName = F("Standby Time"),
+        .hasHelpText = true,
+        .helpText = F(
+            "Time in minutes until the heater is turned off. Timer is reset by brew detection."),
+        .type = kDouble,
+        .section = sPowerSection,
+        .position = 28,
+        .show = [] { return true; },
+        .minValue = STANDBY_MODE_TIME_MIN,
+        .maxValue = STANDBY_MODE_TIME_MAX,
+        .ptr = (void *)&standbyModeTime
+    };
+
     editableVars["VERSION"] = {
         .displayName = F("Version"),
         .hasHelpText = false,
         .helpText = "",
         .type = kCString,
         .section = sOtherSection,
-        .position = 27,
+        .position = 29,
         .show = [] { return false; },
         .minValue = 0,
         .maxValue = 1,
@@ -1839,6 +1954,7 @@ void setup() {
     mqttVars["aggTv"] = []{ return &editableVars.at("PID_TV"); };
     mqttVars["aggIMax"] = []{ return &editableVars.at("PID_I_MAX"); };
     mqttVars["steamKp"] = []{ return &editableVars.at("STEAM_KP"); };
+    mqttVars["standbyModeOn"] = []{ return &editableVars.at("STANDBY_MODE_ON"); };
 
     if (ONLYPID == 0) {
         mqttVars["brewtime"] = []{ return &editableVars.at("BREW_TIME"); };
@@ -1865,9 +1981,11 @@ void setup() {
     // Values reported to MQTT
     mqttSensors["temperature"] = []{ return temperature; };
     mqttSensors["heaterPower"] = []{ return pidOutput; };
+    mqttSensors["standbyModeTimeRemaining"] = []{ return standbyModeRemainingTimeMillis / 1000; };
     mqttSensors["currentKp"] = []{ return bPID.GetKp(); };
     mqttSensors["currentKi"] = []{ return bPID.GetKi(); };
     mqttSensors["currentKd"] = []{ return bPID.GetKd(); };
+    mqttSensors["machineState"] = []{ return machineState; };
 
     Serial.begin(115200);
 
@@ -1896,14 +2014,18 @@ void setup() {
     pinMode(PIN_VALVE, OUTPUT);
     pinMode(PIN_PUMP, OUTPUT);
     pinMode(PIN_HEATER, OUTPUT);
-    pinMode(PIN_STEAMSWITCH, INPUT);
     digitalWrite(PIN_VALVE, relayOFF);
     digitalWrite(PIN_PUMP, relayOFF);
     digitalWrite(PIN_HEATER, LOW);
 
     // IF POWERSWITCH is connected
     if (POWERSWITCHTYPE > 0) {
-        pinMode(PIN_POWERSWITCH, INPUT);
+        pinMode(PIN_POWERSWITCH, INPUT_PULLDOWN);
+    }
+
+    // IF STEAMSWITCH is connected
+    if (STEAMSWITCHTYPE > 0) {
+        pinMode(PIN_STEAMSWITCH, INPUT_PULLDOWN);
     }
 
     // IF Voltage sensor selected
@@ -1914,7 +2036,9 @@ void setup() {
         pinMode(PIN_BREWSWITCH, INPUT_PULLDOWN);
     }
 
-    pinMode(PIN_STEAMSWITCH, INPUT_PULLDOWN);
+    if (TEMP_LED) {
+        pinMode(PIN_STATUSLED, OUTPUT);
+    }
 
     #if OLED_DISPLAY != 0
         u8g2.setI2CAddress(oled_i2c * 2);
@@ -1948,6 +2072,9 @@ void setup() {
             mqtt.setServer(mqtt_server_ip, mqtt_server_port);
             mqtt.setCallback(mqtt_callback);
             checkMQTT();
+            #if MQTT_HASSIO_SUPPORT == 1  // Send Home Assistant MQTT discovery messages
+            sendHASSIODiscoveryMsg();
+            #endif
         }
 
         if (INFLUXDB == 1) {
@@ -1978,7 +2105,7 @@ void setup() {
 
     // TSic 306 temp sensor
     #if TEMPSENSOR == 2
-        temperature = Sensor2.getTemp();
+        temperature = Sensor2.getTemp(15);
     #endif
 
     temperature -= brewTempOffset;
@@ -2013,6 +2140,11 @@ void setup() {
 
 void loop() {
     looppid();
+
+    if (TEMP_LED) {
+        loopLED();
+    }
+
     checkForRemoteSerialClients();
 }
 
@@ -2022,10 +2154,21 @@ void looppid() {
     if (WiFi.status() == WL_CONNECTED && offlineMode == 0) {
         if (MQTT == 1) {
             checkMQTT();
-            writeSysParamsToMQTT();
-
+            writeSysParamsToMQTT(true); // Continue on error
             if (mqtt.connected() == 1) {
                 mqtt.loop();
+                #if MQTT_HASSIO_SUPPORT == 1
+                if (millis() - lastHomeAssistantDiscoveryExecutionTime >= HomeAssistantDiscoveryExecutionInterval) {
+                    sendHASSIODiscoveryMsg();
+                    lastHomeAssistantDiscoveryExecutionTime = millis();
+                }
+                #endif
+                mqtt_was_connected = true;
+            }
+            // Supress debug messages until we have a connection etablished
+            else if(mqtt_was_connected) {
+                debugPrintln("MQTT disconnected\n");
+                mqtt_was_connected = false;
             }
         }
 
@@ -2091,11 +2234,17 @@ void looppid() {
         checkPressure();
     #endif
 
-    brew();                  // start brewing if button pressed
-    checkSteamON();          // check for steam
+    brew();
+    checkSteamON();
     setEmergencyStopTemp();
-    checkpowerswitch();
-    handleMachineState();      // update machineState
+    checkPowerSwitch();
+    checkSteamSwitch();
+
+    if (standbyModeOn && machineState != kStandby) {
+        updateStandbyTimer();
+    }
+    
+    handleMachineState(); 
 
     if (INFLUXDB == 1  && offlineMode == 0 ) {
         sendInflux();
@@ -2120,7 +2269,7 @@ void looppid() {
     }
 #endif
 
-    if (machineState == kPidOffline || machineState == kSensorError || machineState == kEmergencyStop || machineState == kEepromError || brewPIDdisabled) {
+    if (machineState == kPidOffline || machineState == kSensorError || machineState == kEmergencyStop || machineState == kEepromError || machineState == kStandby || brewPIDdisabled) {
         if (pidMode == 1) {
             // Force PID shutdown
             pidMode = 0;
@@ -2225,6 +2374,15 @@ void looppid() {
     // sensor error OR Emergency Stop
 }
 
+void loopLED() {
+    if ((machineState == kPidNormal && (fabs(temperature  - setpoint) < 0.3)) || (temperature > 115 && fabs(temperature - setpoint) < 5)) {
+        digitalWrite(PIN_STATUSLED, HIGH);
+    }
+    else {
+        digitalWrite(PIN_STATUSLED, LOW);
+    }
+}
+
 void setBackflush(int backflush) {
     backflushON = backflush;
 }
@@ -2315,6 +2473,8 @@ int readSysParamsFromStorage(void) {
     if (sysParaSteamSetpoint.getStorage() != 0) return -1;
     if (sysParaWeightSetpoint.getStorage() != 0) return -1;
     if (sysParaWifiCredentialsSaved.getStorage() != 0) return -1;
+    if (sysParaStandbyModeOn.getStorage() != 0) return -1;
+    if (sysParaStandbyModeTime.getStorage() != 0) return -1;
 
     return 0;
 }
@@ -2349,6 +2509,8 @@ int writeSysParamsToStorage(void) {
     if (sysParaSteamSetpoint.setStorage() != 0) return -1;
     if (sysParaWeightSetpoint.setStorage() != 0) return -1;
     if (sysParaWifiCredentialsSaved.setStorage() != 0) return -1;
+    if (sysParaStandbyModeOn.setStorage() != 0) return -1;
+    if (sysParaStandbyModeTime.setStorage() != 0) return -1;
 
     return storageCommit();
 }

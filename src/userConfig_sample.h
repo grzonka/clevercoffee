@@ -55,12 +55,14 @@ enum MACHINE {
 #define ONLYPIDSCALE 0             // 0 = off , 1 = OnlyPID with Scale
 #define BREWMODE 1                 // 1 = Brew by time (with preinfusion); 2 = Brew by weight (from scale)
 #define BREWDETECTION 0            // 0 = off, 1 = Software (Onlypid 1), 2 = Hardware (Onlypid 0), 3 = Sensor/Hardware for Only PID
-#define BREWSWITCHTYPE 1           // 1 = normal Switch, 2 = Trigger Switch
-#define POWERSWITCHTYPE 0          // 0 = no switch connected, 1 = normal Switch, 2 = Trigger Switch
+#define BREWSWITCHTYPE 0           // 0 = no switch connected, 1 = normal switch, 2 = trigger switch
+#define POWERSWITCHTYPE 0          // 0 = no switch connected, 1 = normal switch, 2 = trigger switch
+#define STEAMSWITCHTYPE 0          // 0 = no switch connected, 1 = normal switch, 2 = trigger switch
 #define TRIGGERTYPE HIGH           // LOW = low trigger, HIGH = high trigger relay for pump & valve
 #define VOLTAGESENSORTYPE HIGH     // BREWDETECTION 3 configuration
 #define PINMODEVOLTAGESENSOR INPUT // Mode INPUT_PULLUP, INPUT or INPUT_PULLDOWN_16 (Only Pin 16)
-#define PRESSURESENSOR 0           // 1 = pressure sensor connected
+#define PRESSURESENSOR 0           // 0 = no pressure sensor connected, 1 = pressure sensor connected
+#define TEMP_LED 1                 // Blink status LED when temp is in range
 
 // Brew Scale
 #define SCALE_SAMPLES 2                     // Load cell sample rate
@@ -84,13 +86,16 @@ enum MACHINE {
 #define MQTT 0                             // 1 = MQTT enabled, 0 = MQTT disabled
 #define MQTT_USERNAME "mymqttuser"
 #define MQTT_PASSWORD "mymqttpass"
-#define MQTT_TOPIC_PREFIX "custom/Küche."  // topic will be "<MQTT_TOPIC_PREFIX><HOSTNAME>/<READING>"
-#define MQTT_SERVER_IP "XXX.XXX.XXX.XXX"   // IP-Address of locally installed mqtt server
-#define MQTT_SERVER_PORT 1883
+#define MQTT_TOPIC_PREFIX "custom/Küche."               // topic will be "<MQTT_TOPIC_PREFIX><HOSTNAME>/<READING>"
+#define MQTT_SERVER_IP "XXX.XXX.XXX.XXX"                // IP-Address of the MQTT Server
+#define MQTT_SERVER_PORT 1883                           // Port of the specified MQTT Server
+#define MQTT_HASSIO_SUPPORT 0                           // Enables the Homeassistant Auto Discovery Feature
+#define MQTT_HASSIO_DISCOVERY_PREFIX "homeassistant"    // Homeassistant Auto Discovery Prefix
 
 // INFLUXDB
 #define INFLUXDB 0                 // 1 = INFLUX enabled, 0 = INFLUX disabled
 #define INFLUXDB_URL ""            // InfluxDB server address
+#define INFLUXDB_INSECURE 1        // 1 = INFLUXClient setInsecure enabled , 0 = INFLUXClient setInsecure disabled
 #define INFLUXDB_AUTH_TYPE 1       // 1 = API Token , 2 = User/Pass
 #define INFLUXDB_API_TOKEN ""
 #define INFLUXDB_ORG_NAME ""
@@ -98,6 +103,8 @@ enum MACHINE {
 #define INFLUXDB_PASSWORD ""
 #define INFLUXDB_DB_NAME "coffee"  // InfluxDB bucket name
 #define INFLUXDB_INTERVAL 5000     // Send interval in milliseconds
+#define INFLUXDB_TIMEOUT 5000      // InfluxDB httpReadTimeout
+#define INFLUXDB_RETRIES 50         // Amount of retries to etablish an Influxdb Connection before disabling InfluxDB at all
 
 // PID Parameters (not yet in Web interface)
 #define EMA_FACTOR 0.6             // Smoothing of input that is used for Tv (derivative component of PID). Smaller means less smoothing but also less delay, 0 means no filtering
